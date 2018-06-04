@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"time"
 	"sync"
 
 	"github.com/neelance/graphql-go/errors"
@@ -35,6 +36,27 @@ func (r *Request) handlePanic(ctx context.Context) {
 		r.AddError(makePanicError(value))
 	}
 }
+
+// buffer pool to reduce GC
+var buffers = sync.Pool{
+	// New is called when a new instance is needed
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// GetBuffer fetches a buffer from the pool
+func GetBuffer() *bytes.Buffer {
+	return buffers.Get().(*bytes.Buffer)
+}
+
+// PutBuffer returns a buffer to the pool
+func PutBuffer(buf *bytes.Buffer) {
+	buf.Reset()
+	buffers.Put(buf)
+}
+
+
 
 func makePanicError(value interface{}) *errors.QueryError {
 	return errors.Errorf("graphql: panic occurred: %v", value)
@@ -75,7 +97,7 @@ func (r *Request) execSelections(ctx context.Context, sels []selected.Selection,
 			go func(f *fieldToExec) {
 				defer wg.Done()
 				defer r.handlePanic(ctx)
-				f.out = new(bytes.Buffer)
+				f.out = GetBuffer()
 				execFieldSelection(ctx, r, f, &pathSegment{path, f.field.Alias}, true)
 			}(f)
 		}
@@ -93,6 +115,7 @@ func (r *Request) execSelections(ctx context.Context, sels []selected.Selection,
 		out.WriteByte(':')
 		if async {
 			out.Write(f.out.Bytes())
+			PutBuffer(f.out)
 			continue
 		}
 		f.out = out
@@ -147,67 +170,106 @@ func typeOf(tf *selected.TypenameField, resolver reflect.Value) string {
 	return ""
 }
 
-func execFieldSelection(ctx context.Context, r *Request, f *fieldToExec, path *pathSegment, applyLimiter bool) {
-	if applyLimiter {
-		r.Limiter <- struct{}{}
+type fastTrack struct {
+	sync.RWMutex
+	m map[string]bool
+}
+
+func (f * fastTrack) add(key string,b bool){
+	f.Lock()
+	f.m[key]=b
+	f.Unlock()
+}
+func (f * fastTrack) get(key string) bool{
+	f.RLock()
+	if val, ok := f.m[key]; ok {
+		f.RUnlock()
+		return val
 	}
+	f.RUnlock()
+	return false
+}
 
+var fastTrackObj =fastTrack{
+	m: make(map[string]bool),
+}
+
+func execFieldSelection(ctx context.Context, r *Request, f *fieldToExec, path *pathSegment, applyLimiter bool) {
 	var result reflect.Value
-	var err *errors.QueryError
-
-	traceCtx, finish := r.Tracer.TraceField(ctx, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
-	defer func() {
-		finish(err)
-	}()
-
-	err = func() (err *errors.QueryError) {
-		defer func() {
-			if panicValue := recover(); panicValue != nil {
-				r.Logger.LogPanic(ctx, panicValue)
-				err = makePanicError(panicValue)
-				err.Path = path.toSlice()
-			}
-		}()
-
-		if f.field.FixedResult.IsValid() {
-			result = f.field.FixedResult
-			return nil
-		}
-
-		if err := traceCtx.Err(); err != nil {
-			return errors.Errorf("%s", err) // don't execute any more resolvers if context got cancelled
-		}
-
+	if(fastTrackObj.get(f.field.TypeName+" "+f.field.Name)){
 		var in []reflect.Value
-		if f.field.HasContext {
-			in = append(in, reflect.ValueOf(traceCtx))
-		}
 		if f.field.ArgsPacker != nil {
 			in = append(in, f.field.PackedArgs)
 		}
 		callOut := f.resolver.Method(f.field.MethodIndex).Call(in)
 		result = callOut[0]
-		if f.field.HasError && !callOut[1].IsNil() {
-			resolverErr := callOut[1].Interface().(error)
-			err := errors.Errorf("%s", resolverErr)
-			err.Path = path.toSlice()
-			err.ResolverError = resolverErr
-			return err
+		r.execSelectionSet(ctx, f.sels, f.field.Type, path, result, f.out)
+	}else{
+
+		if applyLimiter {
+			r.Limiter <- struct{}{}
 		}
-		return nil
-	}()
 
-	if applyLimiter {
-		<-r.Limiter
+		var result reflect.Value
+		var err *errors.QueryError
+
+		traceCtx, finish := r.Tracer.TraceField(ctx, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
+		defer func() {
+			finish(err)
+		}()
+		ts:=time.Now().UnixNano()
+		err = func() (err *errors.QueryError) {
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					r.Logger.LogPanic(ctx, panicValue)
+					err = makePanicError(panicValue)
+					err.Path = path.toSlice()
+				}
+			}()
+
+			if f.field.FixedResult.IsValid() {
+				result = f.field.FixedResult
+				return nil
+			}
+
+			if err := traceCtx.Err(); err != nil {
+				return errors.Errorf("%s", err) // don't execute any more resolvers if context got cancelled
+			}
+
+			var in []reflect.Value
+			if f.field.HasContext {
+				in = append(in, reflect.ValueOf(traceCtx))
+			}
+			if f.field.ArgsPacker != nil {
+				in = append(in, f.field.PackedArgs)
+			}
+			callOut := f.resolver.Method(f.field.MethodIndex).Call(in)
+			result = callOut[0]
+			if f.field.HasError && !callOut[1].IsNil() {
+				resolverErr := callOut[1].Interface().(error)
+				err := errors.Errorf("%s", resolverErr)
+				err.Path = path.toSlice()
+				err.ResolverError = resolverErr
+				return err
+			}
+			return nil
+		}()
+		te:=time.Now().UnixNano()
+		if(err==nil && te-ts<time.Millisecond.Nanoseconds()){
+			fastTrackObj.add(f.field.TypeName+" "+f.field.Name,true)
+		}
+		if applyLimiter {
+			<-r.Limiter
+		}
+
+		if err != nil {
+			r.AddError(err)
+			f.out.WriteString("null") // TODO handle non-nil
+			return
+		}
+
+		r.execSelectionSet(traceCtx, f.sels, f.field.Type, path, result, f.out)
 	}
-
-	if err != nil {
-		r.AddError(err)
-		f.out.WriteString("null") // TODO handle non-nil
-		return
-	}
-
-	r.execSelectionSet(traceCtx, f.sels, f.field.Type, path, result, f.out)
 }
 
 func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selection, typ common.Type, path *pathSegment, resolver reflect.Value, out *bytes.Buffer) {
@@ -241,12 +303,14 @@ func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selectio
 		if selected.HasAsyncSel(sels) {
 			var wg sync.WaitGroup
 			wg.Add(l)
-			entryouts := make([]bytes.Buffer, l)
+			entryouts := make([]*bytes.Buffer, l)
 			for i := 0; i < l; i++ {
 				go func(i int) {
 					defer wg.Done()
 					defer r.handlePanic(ctx)
-					r.execSelectionSet(ctx, sels, t.OfType, &pathSegment{path, i}, resolver.Index(i), &entryouts[i])
+					entryouts[i]=GetBuffer()
+
+					r.execSelectionSet(ctx, sels, t.OfType, &pathSegment{path, i}, resolver.Index(i), entryouts[i])
 				}(i)
 			}
 			wg.Wait()
@@ -257,6 +321,7 @@ func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selectio
 					out.WriteByte(',')
 				}
 				out.Write(entryout.Bytes())
+				PutBuffer(entryout)
 			}
 			out.WriteByte(']')
 			return
